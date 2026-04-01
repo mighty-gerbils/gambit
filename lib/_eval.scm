@@ -5466,11 +5466,10 @@
                (script-callback script-line abs-path)
                (##register-module-descrs module-descrs)
                (##load-modules
-                (##list->vector
-                 (##map (lambda (md)
-                          (##vector-last
-                           (macro-module-descr-supply-modules md)))
-                        (##vector->list module-descrs))))
+                (##map (lambda (md)
+                         (##vector-last
+                          (macro-module-descr-supply-modules md)))
+                       (##vector->list module-descrs)))
                (##path-unresolve abs-path))))))
 
   (define (load-no-ext psettings path)

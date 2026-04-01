@@ -1,9 +1,9 @@
 /* File: "mem.c" */
 
-/* Copyright (c) 1994-2024 by Marc Feeley, All Rights Reserved.  */
+/* Copyright (c) 1994-2026 by Marc Feeley, All Rights Reserved.  */
 
 #define ___INCLUDED_FROM_MEM
-#define ___VERSION 409005
+#define ___VERSION 409007
 #include "gambit.h"
 
 #include "os_setup.h"
@@ -84,13 +84,13 @@
  *
  * Scheme objects are encoded using integers of type ___WORD.  A
  * ___WORD either encodes an immediate value or encodes a pointer
- * when the object is memory allocated.  The two lower bits of a
+ * when the object is memory allocated.  The 2 or 3 lower bits of a
  * ___WORD contain a primary type tag for the object and the other
  * bits contain the immediate value or the pointer.  Because all
  * memory allocated objects are aligned on ___WORD boundaries (and a
- * ___WORD is either 4 or 8 bytes), the two lower bits of pointers
+ * ___WORD is either 4 or 8 bytes), the 2 or 3 lower bits of pointers
  * are zero and can be used to store the tag without reducing the
- * address space.  The four tags are:
+ * address space.  When 2 tag bits are used, the four tags are:
  *
  *  immediate:
  *    ___tFIXNUM    object is a small integer (fixnum)
@@ -103,6 +103,8 @@
  *    otherwise
  *    ___tMEM1 = ___tSUBTYPED              subtyped object, but not a pair
  *    ___tMEM2 = ___tPAIR                  a pair
+ *
+ * See the file gambit.h for the tag assignments when 3 tag bits are used.
  *
  * A special type of object exists to support object finalization:
  * 'will' objects.  Wills contain a weak reference to an object, the
@@ -324,6 +326,8 @@
 #define the_msections           ___VMSTATE_MEM(the_msections_)
 #define alloc_msection          ___VMSTATE_MEM(alloc_msection_)
 #define nb_msections_assigned   ___VMSTATE_MEM(nb_msections_assigned_)
+#define target_msections_hist   ___VMSTATE_MEM(target_msections_hist_)
+#define target_msections_hist_last ___VMSTATE_MEM(target_msections_hist_last_)
 #define target_processor_count  ___VMSTATE_MEM(target_processor_count_)
 
 #ifndef ___SINGLE_THREADED_VMS
@@ -366,19 +370,72 @@
 
 /*---------------------------------------------------------------------------*/
 
+/*
+ * File-static spinlock to protect the global symbol/keyword tables
+ * and global variable list from concurrent access by multiple
+ * processors.  Kept outside any struct to avoid changing the
+ * ___global_state_struct layout (ABI compatibility).
+ */
+
 #ifdef ___SINGLE_THREADED_VMS
 
 #define ALLOC_MEM_LOCK()
 #define ALLOC_MEM_UNLOCK()
 #define MISC_MEM_LOCK()
 #define MISC_MEM_UNLOCK()
+#define SYMKEY_LOCK()
+#define SYMKEY_UNLOCK()
+#define RC_LOCK()
+#define RC_UNLOCK()
+#define GCHT_LOCK(ht)
+#define GCHT_UNLOCK(ht)
+#define GCHT_TABLE_LOCK(ht)
+#define GCHT_TABLE_UNLOCK(ht)
 
 #else
+
+___SPINLOCK_DECL(symkey_lock_storage)
+___SPINLOCK_DECL(rc_lock_storage)
 
 #define ALLOC_MEM_LOCK() ___SPINLOCK_LOCK(alloc_mem_lock)
 #define ALLOC_MEM_UNLOCK() ___SPINLOCK_UNLOCK(alloc_mem_lock)
 #define MISC_MEM_LOCK() ___SPINLOCK_LOCK(misc_mem_lock)
 #define MISC_MEM_UNLOCK() ___SPINLOCK_UNLOCK(misc_mem_lock)
+#define SYMKEY_LOCK() ___SPINLOCK_LOCK(symkey_lock_storage)
+#define SYMKEY_UNLOCK() ___SPINLOCK_UNLOCK(symkey_lock_storage)
+#define RC_LOCK() ___SPINLOCK_LOCK(rc_lock_storage)
+#define RC_UNLOCK() ___SPINLOCK_UNLOCK(rc_lock_storage)
+
+/*
+ * External spinlock array for all gc-hash-table locking (both C-level
+ * operations and Scheme-level table-access).  Uses a fixed array of
+ * spinlocks indexed by hashing the gcht address.  This is GC-safe
+ * because the locks are external to gc-hash-table objects, so GC's
+ * use of body[0] (GCHASHTABLE_NEXT) for chaining doesn't interfere.
+ */
+#define GCHT_TABLE_LOCK_COUNT 64
+static ___VOLATILE ___WORD gcht_table_lock_words[GCHT_TABLE_LOCK_COUNT];
+
+#define GCHT_TABLE_LOCK_INDEX(ht) \
+  ((___CAST(___UWORD, ht) >> 6) & (GCHT_TABLE_LOCK_COUNT - 1))
+
+#define GCHT_TABLE_LOCK(ht) \
+  do { \
+    ___VOLATILE ___WORD *___p = \
+      &gcht_table_lock_words[GCHT_TABLE_LOCK_INDEX(ht)]; \
+    while (___COMPARE_AND_SWAP_WORD(___CAST(___WORD*,___p), 0, 1) != 0) \
+      ___CPU_RELAX(); \
+  } while (0)
+
+#define GCHT_TABLE_UNLOCK(ht) \
+  do { \
+    ___SHARED_MEMORY_BARRIER(); \
+    gcht_table_lock_words[GCHT_TABLE_LOCK_INDEX(ht)] = 0; \
+  } while (0)
+
+/* C-level hash table functions use the same external spinlock array */
+#define GCHT_LOCK(ht)   GCHT_TABLE_LOCK(ht)
+#define GCHT_UNLOCK(ht) GCHT_TABLE_UNLOCK(ht)
 
 #endif
 
@@ -712,12 +769,18 @@ void *ptr;)
   ___PSGET
   ___rc_header *h = ___CAST(___rc_header*, ptr) - 1;
   ___rc_header *head = &rc_head;
-  ___rc_header *tail = head->prev;
+  ___rc_header *tail;
+
+  RC_LOCK();
+
+  tail = head->prev;
 
   h->prev = tail;
   h->next = head;
   head->prev = h;
   tail->next = h;
+
+  RC_UNLOCK();
 }
 
 
@@ -747,13 +810,24 @@ void *ptr;)
     {
       ___rc_header *h = ___CAST(___rc_header*,ptr) - 1;
 
+#ifndef ___SINGLE_THREADED_VMS
+      if (___FETCH_AND_ADD_WORD(&h->refcount, -1) == 1)
+#else
       if (--h->refcount == 0)
+#endif
         {
-          ___rc_header *prev = h->prev;
-          ___rc_header *next = h->next;
+          ___rc_header *prev;
+          ___rc_header *next;
+
+          RC_LOCK();
+
+          prev = h->prev;
+          next = h->next;
 
           next->prev = prev;
           prev->next = next;
+
+          RC_UNLOCK();
 
           ___FREE_MEM(h);
         }
@@ -769,7 +843,11 @@ void *ptr;)
   if (ptr != 0)
     {
       ___rc_header *h = ___CAST(___rc_header*,ptr) - 1;
+#ifndef ___SINGLE_THREADED_VMS
+      ___FETCH_AND_ADD_WORD(&h->refcount, 1);
+#else
       h->refcount++;
+#endif
     }
 }
 
@@ -1308,7 +1386,7 @@ ___glo_struct *glo;)
 
       for (i=1; i<len; i++)
         {
-          ___SCMOBJ probe = ___FIELD(___GSTATE->symbol_table,i);
+          ___SCMOBJ probe = ___VECTORELEM(___GSTATE->symbol_table, i);
 
           while (probe != ___NUL)
             {
@@ -1317,7 +1395,7 @@ ___glo_struct *glo;)
                   result = probe;
                   goto end_search;
                 }
-              probe = ___FIELD(probe,___SYMKEY_NEXT);
+              probe = ___SYMKEY_NEXT_FIELD(probe);
             }
         }
     end_search:;
@@ -1355,6 +1433,13 @@ ___SCMOBJ ___make_global_var
         (sym)
 ___SCMOBJ sym;)
 {
+  /*
+   * Protect with symkey_lock to prevent concurrent creation of
+   * the same global variable by multiple processors.
+   */
+
+  SYMKEY_LOCK();
+
   if (___GLOBALVARSTRUCT(sym) == 0)
     {
       ___glo_struct *glo = ___CAST(___glo_struct*,
@@ -1364,7 +1449,10 @@ ___SCMOBJ sym;)
                                       0));
 
       if (glo == 0)
-        return ___FIX(___HEAP_OVERFLOW_ERR);
+        {
+          SYMKEY_UNLOCK();
+          return ___FIX(___HEAP_OVERFLOW_ERR);
+        }
 
 #ifdef ___SINGLE_VM
       glo->val = ___UNB1;
@@ -1376,8 +1464,10 @@ ___SCMOBJ sym;)
 
       ___PRMCELL(glo->prm) = ___FAL;
 
-      ___FIELD(sym,___SYMBOL_GLOBAL) = ___CAST(___SCMOBJ,glo);
+      ___SYMBOL_GLOBAL_FIELD(sym) = ___CAST(___SCMOBJ,glo);
     }
+
+  SYMKEY_UNLOCK();
 
   return sym;
 }
@@ -1395,7 +1485,7 @@ ___SCMOBJ val;)
 
   for (i = ___INT(___VECTORLENGTH(___GSTATE->symbol_table)) - 1; i>0; i--)
     {
-      sym = ___FIELD(___GSTATE->symbol_table,i);
+      sym = ___VECTORELEM(___GSTATE->symbol_table, i);
 
       while (sym != ___NUL)
        {
@@ -1408,7 +1498,7 @@ ___SCMOBJ val;)
               break;
             }
 
-          sym = ___FIELD(sym,___SYMKEY_NEXT);
+          sym = ___SYMKEY_NEXT_FIELD(sym);
         }
     }
 
@@ -1430,7 +1520,11 @@ ___EXP_FUNC(void,___still_obj_refcount_inc)
         (obj)
 ___WORD obj;)
 {
+#ifndef ___SINGLE_THREADED_VMS
+  ___FETCH_AND_ADD_WORD(&___BODY0(obj)[___STILL_REFCOUNT-___STILL_BODY], 1);
+#else
   ___BODY0(obj)[___STILL_REFCOUNT-___STILL_BODY]++;
+#endif
 }
 
 
@@ -1444,7 +1538,11 @@ ___EXP_FUNC(void,___still_obj_refcount_dec)
         (obj)
 ___WORD obj;)
 {
+#ifndef ___SINGLE_THREADED_VMS
+  ___FETCH_AND_ADD_WORD(&___BODY0(obj)[___STILL_REFCOUNT-___STILL_BODY], -1);
+#else
   ___BODY0(obj)[___STILL_REFCOUNT-___STILL_BODY]--;
+#endif
 }
 
 
@@ -1516,10 +1614,21 @@ ___SIZE_TS bytes;)
 
   base[___PERM_HEADER] = ___MAKE_HD(bytes, subtype, ___PERM);
 
-  if (subtype == ___sPAIR)
-    return ___PAIR_FROM_BODY(body);
-  else
-    return ___SUBTYPED_FROM_BODY(body);
+#if ___tPAIR != ___tSUBTYPED
+  if (subtype == ___sPAIR) return ___PAIR_FROM_BODY(body);
+#endif
+
+#ifndef ___NAN_BOXING
+#if  ___tFLONUM != ___tSUBTYPED
+  if (subtype == ___sFLONUM) return ___FLONUM_FROM_BODY(body);
+#endif
+#endif
+
+#if ___tVECTOR != ___tSUBTYPED
+  if (subtype == ___sVECTOR) return ___VECTOR_FROM_BODY(body);
+#endif
+
+  return ___SUBTYPED_FROM_BODY(body);
 }
 
 
@@ -1661,10 +1770,21 @@ ___SIZE_TS bytes;)
 
   /* Return tagged reference to still object. */
 
-  if (subtype == ___sPAIR)
-    return ___PAIR_FROM_BODY(body);
-  else
-    return ___SUBTYPED_FROM_BODY(body);
+#if ___tPAIR != ___tSUBTYPED
+  if (subtype == ___sPAIR) return ___PAIR_FROM_BODY(body);
+#endif
+
+#ifndef ___NAN_BOXING
+#if ___tFLONUM != ___tSUBTYPED
+  if (subtype == ___sFLONUM) return ___FLONUM_FROM_BODY(body);
+#endif
+#endif
+
+#if ___tVECTOR != ___tSUBTYPED
+  if (subtype == ___sVECTOR) return ___VECTOR_FROM_BODY(body);
+#endif
+
+  return ___SUBTYPED_FROM_BODY(body);
 }
 
 
@@ -1766,7 +1886,7 @@ ___WORD init;)
         {
           int i;
           for (i=0; i<length; i++)
-            ___FIELD(obj, i) = init;
+            ___VECTORELEM(obj, i) = init;
         }
 
       return obj;
@@ -1834,7 +1954,7 @@ ___SCMOBJ str;)
   ___UM32 h = FN1a_offset_basis;
 
   for (i=0; i<n; i++)
-    h = HASH_STEP(h,___INT(___STRINGREF(str,___FIX(i))));
+    h = HASH_STEP(h,___ORD(___STRINGREF(str,___FIX(i))));
 
   return ___FIX(h);
 }
@@ -1886,11 +2006,16 @@ ___SIZE_TS length;)
   ___SCMOBJ tbl = ___make_vector (NULL, length+1, ___NUL);
 
   if (!___FIXNUMP(tbl))
-    ___FIELD(tbl,0) = ___FIX(0);
+    ___VECTORELEM(tbl, 0) = ___FIX(0);
 
   return tbl;
 }
 
+
+/*
+ * ___intern_symkey adds a symbol/keyword to the global table.
+ * Caller must hold SYMKEY_LOCK when there are multiple processors.
+ */
 
 void ___intern_symkey
    ___P((___SCMOBJ symkey),
@@ -1899,7 +2024,7 @@ ___SCMOBJ symkey;)
 {
   unsigned int subtype = ___INT(___SUBTYPE(symkey));
   ___SCMOBJ tbl = symkey_table (subtype);
-  int i = ___INT(___FIELD(symkey,___SYMKEY_HASH))
+  int i = ___INT(___SYMKEY_HASH_FIELD(symkey))
           % (___INT(___VECTORLENGTH(tbl)) - 1)
           + 1;
 
@@ -1907,17 +2032,17 @@ ___SCMOBJ symkey;)
    * Add symbol/keyword to the appropriate list.
    */
 
-  ___FIELD(symkey,___SYMKEY_NEXT) = ___FIELD(tbl,i);
-  ___FIELD(tbl,i) = symkey;
+  ___SYMKEY_NEXT_FIELD(symkey) = ___VECTORELEM(tbl, i);
+  ___VECTORELEM(tbl, i) = symkey;
 
-  ___FIELD(tbl,0) = ___FIXADD(___FIELD(tbl,0),___FIX(1));
+  ___VECTORELEM(tbl, 0) = ___FIXADD(___VECTORELEM(tbl, 0), ___FIX(1));
 
   /*
    * Grow and rehash the table when it is too loaded (above an average
    * list length of 4).
    */
 
-  if (___INT(___FIELD(tbl,0)) > ___INT(___VECTORLENGTH(tbl)) * 4)
+  if (___INT(___VECTORELEM(tbl, 0)) > ___INT(___VECTORLENGTH(tbl)) * 4)
     {
       int new_len = (___INT(___VECTORLENGTH(tbl))-1) * 2;
       ___SCMOBJ newtbl = alloc_symkey_table (subtype, new_len);
@@ -1926,20 +2051,20 @@ ___SCMOBJ symkey;)
         {
           for (i=___INT(___VECTORLENGTH(tbl))-1; i>0; i--)
             {
-              ___SCMOBJ probe = ___FIELD(tbl,i);
+              ___SCMOBJ probe = ___VECTORELEM(tbl, i);
 
               while (probe != ___NUL)
                 {
                   ___SCMOBJ symkey = probe;
-                  int j = ___INT(___FIELD(symkey,___SYMKEY_HASH))%new_len + 1;
+                  int j = ___INT(___SYMKEY_HASH_FIELD(symkey))%new_len + 1;
 
-                  probe = ___FIELD(symkey,___SYMKEY_NEXT);
-                  ___FIELD(symkey,___SYMKEY_NEXT) = ___FIELD(newtbl,j);
-                  ___FIELD(newtbl,j) = symkey;
+                  probe = ___SYMKEY_NEXT_FIELD(symkey);
+                  ___SYMKEY_NEXT_FIELD(symkey) = ___VECTORELEM(newtbl, j);
+                  ___VECTORELEM(newtbl,j) = symkey;
                 }
             }
 
-          ___FIELD(newtbl,0) = ___FIELD(tbl,0);
+          ___VECTORELEM(newtbl, 0) = ___VECTORELEM(tbl, 0);
 
           symkey_table_set (subtype, newtbl);
         }
@@ -1975,11 +2100,11 @@ unsigned int subtype;)
 
   /* object layout is same for ___sSYMBOL and ___sKEYWORD */
 
-  ___FIELD(obj,___SYMKEY_NAME) = name;
-  ___FIELD(obj,___SYMKEY_HASH) = ___hash_scheme_string (name);
+  ___SYMKEY_NAME_FIELD(obj) = name;
+  ___SYMKEY_HASH_FIELD(obj) = ___hash_scheme_string (name);
 
   if (subtype == ___sSYMBOL)
-    ___FIELD(obj,___SYMBOL_GLOBAL) = ___CAST(___SCMOBJ,___CAST(___glo_struct*,0));
+    ___SYMBOL_GLOBAL_FIELD(obj) = ___CAST(___SCMOBJ,___CAST(___glo_struct*,0));
 
   ___intern_symkey (obj);
 
@@ -2003,23 +2128,23 @@ unsigned int subtype;)
     return h;
 
   tbl = symkey_table (subtype);
-  probe = ___FIELD(tbl, ___INT(h) % (___INT(___VECTORLENGTH(tbl))-1) + 1);
+  probe = ___VECTORELEM(tbl, ___INT(h) % (___INT(___VECTORLENGTH(tbl))-1) + 1);
 
   while (probe != ___NUL)
     {
-      ___SCMOBJ name = ___FIELD(probe,___SYMKEY_NAME);
+      ___SCMOBJ name = ___SYMKEY_NAME_FIELD(probe);
       ___SIZE_T i;
       ___SIZE_T n = ___INT(___STRINGLENGTH(name));
       ___UTF_8STRING p = str;
       ___UCS_4 c;
       for (i=0; i<n; i++)
         if (___UTF_8_get_var (&p, c) !=
-            ___CAST(___UCS_4,___INT(___STRINGREF(name,___FIX(i)))))
+            ___CAST(___UCS_4,___ORD(___STRINGREF(name,___FIX(i)))))
           goto next;
       if (___UTF_8_get_var (&p, c) == 0)
         return probe;
     next:
-      probe = ___FIELD(probe,___SYMKEY_NEXT);
+      probe = ___SYMKEY_NEXT_FIELD(probe);
     }
 
   return ___FAL;
@@ -2039,11 +2164,11 @@ unsigned int subtype;)
   ___SCMOBJ h = ___hash_scheme_string (str);
 
   tbl = symkey_table (subtype);
-  probe = ___FIELD(tbl, ___INT(h) % (___INT(___VECTORLENGTH(tbl))-1) + 1);
+  probe = ___VECTORELEM(tbl, ___INT(h) % (___INT(___VECTORLENGTH(tbl))-1) + 1);
 
   while (probe != ___NUL)
     {
-      ___SCMOBJ name = ___FIELD(probe,___SYMKEY_NAME);
+      ___SCMOBJ name = ___SYMKEY_NAME_FIELD(probe);
       ___SIZE_TS i = 0;
       ___SIZE_TS n = ___INT(___STRINGLENGTH(name));
       if (___INT(___STRINGLENGTH(str)) == n)
@@ -2054,7 +2179,7 @@ unsigned int subtype;)
           return probe;
         }
     next:
-      probe = ___FIELD(probe,___SYMKEY_NEXT);
+      probe = ___SYMKEY_NEXT_FIELD(probe);
     }
 
   return ___FAL;
@@ -2069,7 +2194,11 @@ ___SCMOBJ ___make_symkey_from_UTF_8_string
 ___UTF_8STRING str;
 unsigned int subtype;)
 {
-  ___SCMOBJ obj = ___find_symkey_from_UTF_8_string (str, subtype);
+  ___SCMOBJ obj;
+
+  SYMKEY_LOCK();
+
+  obj = ___find_symkey_from_UTF_8_string (str, subtype);
 
   if (obj == ___FAL)
     {
@@ -2082,10 +2211,15 @@ unsigned int subtype;)
                     &name,
                     -1))
           != ___FIX(___NO_ERR))
-        return err;
+        {
+          SYMKEY_UNLOCK();
+          return err;
+        }
 
       obj = ___new_symkey (name, subtype);
     }
+
+  SYMKEY_UNLOCK();
 
   return obj;
 }
@@ -2099,7 +2233,11 @@ ___SCMOBJ ___make_symkey_from_scheme_string
 ___SCMOBJ str;
 unsigned int subtype;)
 {
-  ___SCMOBJ obj = ___find_symkey_from_scheme_string (str, subtype);
+  ___SCMOBJ obj;
+
+  SYMKEY_LOCK();
+
+  obj = ___find_symkey_from_scheme_string (str, subtype);
 
   if (obj == ___FAL)
     {
@@ -2107,7 +2245,10 @@ unsigned int subtype;)
       ___SCMOBJ name = ___alloc_scmobj (NULL, ___sSTRING, n<<___LCS);
 
       if (___FIXNUMP(name))
-        return name;
+        {
+          SYMKEY_UNLOCK();
+          return name;
+        }
 
       memmove (___BODY_AS(name,___tSUBTYPED),
                ___BODY_AS(str,___tSUBTYPED),
@@ -2115,6 +2256,8 @@ unsigned int subtype;)
 
       obj = ___new_symkey (name, subtype);
     }
+
+  SYMKEY_UNLOCK();
 
   return obj;
 }
@@ -2131,19 +2274,25 @@ unsigned int subtype;
 void (*visit) ();
 void *data;)
 {
-  ___SCMOBJ tbl = symkey_table (subtype);
+  ___SCMOBJ tbl;
   int i;
+
+  SYMKEY_LOCK();
+
+  tbl = symkey_table (subtype);
 
   for (i=___INT(___VECTORLENGTH(tbl))-1; i>0; i--)
     {
-      ___SCMOBJ probe = ___FIELD(tbl, i);
+      ___SCMOBJ probe = ___VECTORELEM(tbl, i);
 
       while (probe != ___NUL)
         {
           visit (probe, data);
-          probe = ___FIELD(probe,___SYMKEY_NEXT);
+          probe = ___SYMKEY_NEXT_FIELD(probe);
         }
     }
+
+  SYMKEY_UNLOCK();
 }
 
 
@@ -2224,7 +2373,7 @@ ___SCMOBJ val;)
       int subtype;
       int shift = 0;
 
-      if (___TYP(head) == ___FORW)
+      if (___TESTTYPE(head, ___FORW))
         {
           /* indirect forwarding pointer */
           body = ___BODY0(head);
@@ -2257,7 +2406,7 @@ ___SCMOBJ val;)
               else
                 ___printf ("#<return ");
               if ((sym = ___find_global_var_bound_to (val)) != ___NUL)
-                print_value (___FIELD(sym,___SYMKEY_NAME));
+                print_value (___SYMKEY_NAME_FIELD(sym));
               else
                 {
                   if (___HD_TYP(head) == ___PERM)
@@ -2286,7 +2435,7 @@ ___SCMOBJ val;)
               ___SCMOBJ str = ___SUBTYPED_FROM_BODY(body);
               ___printf ("\"");
               for (i=0; i<___INT(___STRINGLENGTH(str)); i++)
-                ___printf ("%c", ___INT(___STRINGREF(str,___FIX(i))));
+                ___printf ("%c", ___ORD(___STRINGREF(str,___FIX(i))));
               ___printf ("\"");
             }
           else if (subtype == ___sSYMBOL)
@@ -2304,7 +2453,7 @@ ___SCMOBJ val;)
   else if (___FIXNUMP(val))
     ___printf ("%d", ___INT(val));
   else if (___CHARP(val))
-    ___printf ("#\\x%x", ___INT(val));
+    ___printf ("#\\x%x", ___ORD(val));
   else if (val == ___FAL)
     ___printf ("#f");
   else if (val == ___TRU)
@@ -2418,8 +2567,8 @@ do { \
         }
       else
         {
-          ___printf("...\n");
-            probe += skip;
+           ___printf ("...\n");
+           probe += skip;
         }
     }
 }
@@ -2473,16 +2622,14 @@ int max_depth;
 char *prefix;
 int indent;)
 {
-  int typ = ___TYP(obj);
-
   print_prefix (prefix, indent);
 
-  if (typ == ___tFIXNUM)
+  if (___FIXNUMP(obj))
     ___printf ("%d\n", ___INT(obj));
-  else if (typ == ___tSPECIAL)
+  else if (___TESTTYPE(obj, ___tSPECIAL))
     {
       if (obj >= 0)
-        ___printf ("#\\%c\n", ___INT(obj));
+        ___printf ("#\\%c\n", ___ORD(obj));
       else if (obj == ___FAL)
         ___printf ("#f\n");
       else if (obj == ___TRU)
@@ -2519,7 +2666,7 @@ int indent;)
       int subtype;
       int shift = 0;
 
-      if (___TYP(head) == ___FORW)
+      if (___TESTTYPE(head, ___FORW))
         {
           /* indirect forwarding pointer */
           body = ___BODY0(head);
@@ -2540,7 +2687,7 @@ int indent;)
               int i;
               ___printf ("#(\n");
               for (i=0; i<___CAST(int,___HD_WORDS(head)); i++)
-                print_object (___FIELD(obj,i)>>shift, max_depth-1, prefix, indent+2);
+                print_object (___VECTORELEM(obj,i)>>shift, max_depth-1, prefix, indent+2);
               print_prefix (prefix, indent);
               ___printf (")\n");
             }
@@ -2578,11 +2725,11 @@ int indent;)
           break;
         case ___sSYMBOL:
           ___printf ("SYMBOL ");
-          print_object (___FIELD(obj,___SYMKEY_NAME)>>shift, max_depth-1, "", 0);
+          print_object (___SYMKEY_NAME_FIELD(obj)>>shift, max_depth-1, "", 0);
           break;
         case ___sKEYWORD:
           ___printf ("KEYWORD ");
-          print_object (___FIELD(obj,___SYMKEY_NAME)>>shift, max_depth-1, "", 0);
+          print_object (___SYMKEY_NAME_FIELD(obj)>>shift, max_depth-1, "", 0);
           break;
         case ___sFRAME:
           ___printf ("FRAME\n");
@@ -2611,7 +2758,7 @@ int indent;)
             int len = ___HD_BYTES(head)>>___LCS;
             ___printf ("STRING ");
             for (i=0; i<len; i++)
-              ___printf ("%c", ___INT(___STRINGREF(obj,___FIX(i))));
+              ___printf ("%c", ___ORD(___STRINGREF(obj,___FIX(i))));
             ___printf ("\n");
           }
           break;
@@ -2669,11 +2816,11 @@ ___glo_struct *glo;)
 
   for (i = ___INT(___VECTORLENGTH(___GSTATE->symbol_table)) - 1; i>0; i--)
     {
-      sym = ___FIELD(___GSTATE->symbol_table,i);
+      sym = ___VECTORELEM(___GSTATE->symbol_table,i);
 
       while (sym != ___NUL)
         {
-          ___SCMOBJ g = ___FIELD(sym,___SYMBOL_GLOBAL);
+          ___SCMOBJ g = ___SYMBOL_GLOBAL_FIELD(sym);
 
           if (g != ___FIX(0))
             {
@@ -2681,15 +2828,15 @@ ___glo_struct *glo;)
 
               if (p == glo)
                 {
-                  ___SCMOBJ name = ___FIELD(sym,___SYMKEY_NAME);
+                  ___SCMOBJ name = ___SYMKEY_NAME_FIELD(sym);
                   for (i=0; i<___INT(___STRINGLENGTH(name)); i++)
-                    ___printf ("%c", ___INT(___STRINGREF(name,___FIX(i))));
+                    ___printf ("%c", ___ORD(___STRINGREF(name,___FIX(i))));
                   i = 0;
                   break;
                 }
             }
 
-          sym = ___FIELD(sym,___SYMKEY_NEXT);
+          sym = ___SYMKEY_NEXT_FIELD(sym);
         }
     }
 }
@@ -2779,7 +2926,7 @@ char *msg;)
           ___printf ("___STILL ");
         else if (___HD_TYP(head) == ___MOVABLE0)
           ___printf ("___MOVABLE0 ");
-        else if (___TYP(head) == ___FORW)
+        else if (___TESTTYPE(head, ___FORW))
           ___printf ("___FORW ");
         else
           ___printf ("UNKNOWN ");
@@ -2894,7 +3041,7 @@ ___WORD obj;)
       if (pos >= 0 && pos < ___MSECTION_SIZE)
         {
           head = *hd_ptr;
-          if (___TYP(head) == ___FORW)
+          if (___TESTTYPE(head, ___FORW))
             {
               ___WORD *hd_ptr2 = ___BODY0(head)-1;
               int i2 = find_msection (the_msections, hd_ptr2);
@@ -3494,6 +3641,7 @@ ___WORD n;)
             if (head_typ == ___MOVABLE0)
               {
                 ___SIZE_TS words = ___HD_WORDS(head);
+
                 /*TODO: add allocation of handle if using handles*/
 #if ___WS == 4
                 ___BOOL pad = 0;
@@ -3604,7 +3752,7 @@ ___WORD n;)
                   }
 #endif
               }
-            else if (___TYP(head_typ) == ___FORW)
+            else if (___TESTTYPE(head_typ, ___FORW))
               {
                 *cell = ___TAG(___UNTAG_AS(head, ___FORW), ___TYP(obj));
               }
@@ -3643,7 +3791,7 @@ ___WORD *orig_ptr;)
   ___printf ("mark_captured_continuation cf=%p\n", ___CAST(void*,cf));
 #endif
 
-  if (___TYP(cf) == ___tFIXNUM && cf != ___END_OF_CONT_MARKER)
+  if (___FIXNUMP(cf) && cf != ___END_OF_CONT_MARKER)
     {
       /* continuation frame is in the stack */
 
@@ -3684,7 +3832,7 @@ ___WORD *orig_ptr;)
 
       ra2 = ___FP_STK(fp,link+1);
 
-      if (___TYP(ra2) == ___tFIXNUM)
+      if (___FIXNUMP(ra2))
         {
           ___COVER_MARK_CAPTURED_CONTINUATION_ALREADY_COPIED;
           *ptr = ra2; /* already copied, replace by forwarding pointer */
@@ -3756,7 +3904,7 @@ ___WORD *orig_ptr;)
               alloc = alloc_heap_ptr;
             }
 
-          if (___TYP(cf) == ___tFIXNUM && cf != ___END_OF_CONT_MARKER)
+          if (___FIXNUMP(cf) && cf != ___END_OF_CONT_MARKER)
             goto next_frame;
         }
 
@@ -4091,12 +4239,12 @@ ___WORD head;)
 
         frame = ___FP_STK(fp,link+1);
 
-        if (___TYP(frame) == ___tFIXNUM && frame != ___END_OF_CONT_MARKER)
+        if (___FIXNUMP(frame) && frame != ___END_OF_CONT_MARKER)
           ___FP_SET_STK(fp,link+1,___FAL)
 
         mark_frame (___PSP fp, fs, gcmap, nextgcmap);
 
-        if (___TYP(frame) == ___tFIXNUM && frame != ___END_OF_CONT_MARKER)
+        if (___FIXNUMP(frame) && frame != ___END_OF_CONT_MARKER)
           ___FP_SET_STK(fp,link+1,___TAG(___UNTAG_AS(frame, ___tFIXNUM), ___tSUBTYPED))
 
         mark_array (___PSP &body[0], 1);
@@ -4222,7 +4370,7 @@ ___WORD *start;)
   ___ACTLOG_BEGIN_PS(scan_complete_heap_chunk,_);
 #endif
 
-  while (___TYP((head = *ptr)) != ___FORW) /* not end of complete chunk? */
+  while (!___TESTTYPE(head = *ptr, ___FORW)) /* not end of complete chunk? */
     {
       scan_and_advance(ptr, head); /* note: this advances ptr */
     }
@@ -4281,7 +4429,7 @@ ___PSDKR)
   while (ptr != alloc_heap_ptr) /* SITUATION #1 or #2 ? */
     {
       ___WORD head;
-      while (___TYP((head = *ptr)) != ___FORW) /* not end of complete chunk? */
+      while (!___TESTTYPE(head = *ptr, ___FORW)) /* not end of complete chunk? */
         {
           scan_and_advance(ptr, head); /* note: this advances ptr */
           if (ptr == alloc_heap_ptr) /* end of incomplete chunk? */
@@ -4298,7 +4446,9 @@ ___PSDKR)
        * SITUATION #1, at end of complete chunk.
        */
 
+#ifndef ___SINGLE_THREADED_VMS
       ___SPINLOCK_LOCK(heap_chunks_to_scan_lock);
+#endif
 
       while ((hcsh=heap_chunks_to_scan_head) != heap_chunks_to_scan_tail)
         {
@@ -4313,14 +4463,20 @@ ___PSDKR)
 
           ___SHARED_MEMORY_BARRIER(); /* share heap_chunks_to_scan_head */
 
+#ifndef ___SINGLE_THREADED_VMS
           ___SPINLOCK_UNLOCK(heap_chunks_to_scan_lock);
+#endif
 
           scan_complete_heap_chunk (___PSP ptr+1);
 
+#ifndef ___SINGLE_THREADED_VMS
           ___SPINLOCK_LOCK(heap_chunks_to_scan_lock);
+#endif
         }
 
+#ifndef ___SINGLE_THREADED_VMS
       ___SPINLOCK_UNLOCK(heap_chunks_to_scan_lock);
+#endif
 
       /*
        * Scan the incomplete heap chunk currently being created.
@@ -4350,8 +4506,10 @@ ___PSDKR)
         {
           ___WORD head = base[___STILL_BODY-1];
           if (___HD_SUBTYPE(head) == ___sFOREIGN)
-            ___release_foreign
-              (___TAG(base + ___STILL_BODY - ___REFERENCE_TO_BODY, ___tSUBTYPED));
+            {
+              ___release_foreign
+                (___TAG(base + ___STILL_BODY - ___REFERENCE_TO_BODY, ___tSUBTYPED));
+            }
           free_mem_aligned_heap (base);
         }
       else
@@ -4392,8 +4550,10 @@ ___processor_state ___ps;)
       ___WORD link = base[___STILL_LINK];
       ___WORD head = base[___STILL_BODY-1];
       if (___HD_SUBTYPE(head) == ___sFOREIGN)
-        ___release_foreign
-          (___TAG(base + ___STILL_BODY - ___REFERENCE_TO_BODY, ___tSUBTYPED));
+        {
+          ___release_foreign
+            (___TAG(base + ___STILL_BODY - ___REFERENCE_TO_BODY, ___tSUBTYPED));
+        }
       free_mem_aligned_heap (base);
       base = ___CAST(___WORD*,link);
     }
@@ -4523,7 +4683,9 @@ ___processor_state ___ps;)
 
   tospace_offset = ___PSTATE_FROM_PROCESSOR_ID(0,___vms)->mem.tospace_offset_;
 
+#ifndef ___SINGLE_THREADED_VMS
   ___SPINLOCK_INIT(heap_chunks_to_scan_lock);
+#endif
 
   /*
    * Allocate processor's stack and heap.
@@ -4640,6 +4802,7 @@ ___virtual_machine_state ___vms;)
 
   ___SPINLOCK_INIT(misc_mem_lock);
   ___SPINLOCK_INIT(alloc_mem_lock);
+  ___SPINLOCK_INIT(rc_lock_storage);
 
   /*
    * Initialize condition variable to determine end of scan at VM level.
@@ -4739,6 +4902,19 @@ ___virtual_machine_state ___vms;)
 
   nb_msections_assigned = 0;
 
+#if ___TARGET_MSECTIONS_HIST_LENGTH > 0
+
+  {
+    int i;
+
+    for (i=0; i<___TARGET_MSECTIONS_HIST_LENGTH; i++)
+      target_msections_hist[i] = 0;
+
+    target_msections_hist_last = 0;
+  }
+
+#endif
+
   heap_size = compute_heap_space();
 
   return ___FIX(___NO_ERR);
@@ -4782,6 +4958,15 @@ ___SCMOBJ ___setup_mem ___PVOID
    * Create empty global variable list, symbol table and keyword
    * table.
    */
+
+#ifndef ___SINGLE_THREADED_VMS
+  ___SPINLOCK_INIT(symkey_lock_storage);
+  {
+    int ___i;
+    for (___i = 0; ___i < GCHT_TABLE_LOCK_COUNT; ___i++)
+      gcht_table_lock_words[___i] = 0;
+  }
+#endif
 
   ___glo_list_setup ();
 
@@ -4833,6 +5018,7 @@ ___virtual_machine_state ___vms;)
 
   ___SPINLOCK_DESTROY(misc_mem_lock);
   ___SPINLOCK_DESTROY(alloc_mem_lock);
+  ___SPINLOCK_DESTROY(rc_lock_storage);
 
   /*
    * Destroy condition variable to determine end of scan at VM level.
@@ -4872,6 +5058,9 @@ ___virtual_machine_state ___vms;)
 
 void ___cleanup_mem ___PVOID
 {
+#ifndef ___SINGLE_THREADED_VMS
+  ___SPINLOCK_DESTROY(symkey_lock_storage);
+#endif
   free_psections ();
 }
 
@@ -4890,7 +5079,7 @@ ___WORD list;)
       ___WORD *unmarked_body; /* used by the UNMARKED macro */
       int unmarked_typ;
 
-      if (___TYP(will_head) == ___FORW) /* was will forwarded? */
+      if (___TESTTYPE(will_head, ___FORW)) /* was will forwarded? */
         will_body = ___BODY0_AS(will_head,___FORW);
 
       list = will_body[___WILL_NEXT];
@@ -4993,11 +5182,18 @@ ___PSDKR)
 #endif
 #else
 #ifndef ___GC_HASH_TABLE_REHASH_LAZILY
-#ifdef ___SINGLE_THREADED_VMS
+/*
+ * Always use lazy rehash.  Eager rehash uses ___GCHASHTABLE_HASH_STEP
+ * (pointer-based hash) which is only correct for eq? tables.  Non-eq?
+ * tables (equal?, string=?, etc.) place entries using content-based
+ * Scheme hash functions.  Eagerly repositioning them by pointer hash
+ * corrupts the table — creating unreachable entries or infinite probe
+ * loops.  With lazy rehash, eq? tables are rehashed on first access
+ * via ___gc_hash_table_ref/set (which use pointer hash), and non-eq?
+ * tables are marked KEY_MOVED but rehashed correctly by the Scheme
+ * level ##table-access which uses the proper hash function.
+ */
 #define ___GC_HASH_TABLE_REHASH_LAZILY
-#else
-#define ___GC_HASH_TABLE_REHASH_EAGERLY
-#endif
 #endif
 #endif
 
@@ -5289,7 +5485,7 @@ ___PSDKR)
                     {
                       ___WORD key_head = ___BODY0(key)[-1];
 
-                      if (___TYP(key_head) == ___FORW)
+                      if (___TESTTYPE(key_head, ___FORW))
                         {
                           /*
                            * The key is movable and has been
@@ -5300,7 +5496,7 @@ ___PSDKR)
                             {
                               ___WORD val_head = ___BODY0(val)[-1];
 
-                              if (___TYP(val_head) == ___FORW)
+                              if (___TESTTYPE(val_head, ___FORW))
                                 {
                                   /*
                                    * The key is movable and has been
@@ -5390,7 +5586,7 @@ ___PSDKR)
                             {
                               ___WORD val_head = ___BODY0(val)[-1];
 
-                              if (___TYP(val_head) == ___FORW)
+                              if (___TESTTYPE(val_head, ___FORW))
                                 {
                                   /*
                                    * The key is not movable and is
@@ -5447,7 +5643,7 @@ ___PSDKR)
                         {
                           ___WORD val_head = ___BODY0(val)[-1];
 
-                          if (___TYP(val_head) == ___FORW)
+                          if (___TESTTYPE(val_head, ___FORW))
                             {
                               /*
                                * The key is not memory allocated and
@@ -5514,7 +5710,7 @@ ___PSDKR)
                     {
                       ___WORD head = ___BODY0(key)[-1];
 
-                      if (___TYP(head) == ___FORW)
+                      if (___TESTTYPE(head, ___FORW))
                         {
                           /*
                            * The key is movable and has been
@@ -5567,7 +5763,7 @@ ___PSDKR)
                     {
                       ___WORD head = ___BODY0(val)[-1];
 
-                      if (___TYP(head) == ___FORW)
+                      if (___TESTTYPE(head, ___FORW))
                         {
                           /*
                            * The value is movable and has been
@@ -5611,6 +5807,30 @@ ___PSDKR)
 }
 
 
+/*
+ * Scheme-callable lock/unlock for non-eq? hash table access.
+ * Uses the external spinlock array (not body[0]) so GC cannot
+ * interfere with the lock state.
+ */
+___SCMOBJ ___gc_hash_table_table_lock
+   ___P((___SCMOBJ ht),
+        (ht)
+___SCMOBJ ht;)
+{
+  GCHT_TABLE_LOCK(ht);
+  return ___VOID;
+}
+
+___SCMOBJ ___gc_hash_table_table_unlock
+   ___P((___SCMOBJ ht),
+        (ht)
+___SCMOBJ ht;)
+{
+  GCHT_TABLE_UNLOCK(ht);
+  return ___VOID;
+}
+
+
 ___SCMOBJ ___gc_hash_table_ref
    ___P((___SCMOBJ ht,
          ___SCMOBJ key),
@@ -5623,40 +5843,54 @@ ___SCMOBJ key;)
   int probe2;
   int step2;
   ___SCMOBJ obj;
+  ___SCMOBJ result;
+
+  GCHT_LOCK(ht);
 
 #ifdef ___GC_HASH_TABLE_REHASH_LAZILY
 
-  if (!___FIXZEROP(___FIXAND(___FIELD(ht, ___GCHASHTABLE_FLAGS),
+  if (!___FIXZEROP(___FIXAND(___GCHASHTABLE_FLAGS_FIELD(ht),
                              ___FIX(___GCHASHTABLE_FLAG_KEY_MOVED))))
     gc_hash_table_rehash_in_situ (ht);
 
 #endif
 
-  size2 = ___INT(___VECTORLENGTH(ht)) - ___GCHASHTABLE_KEY0;
+  size2 = ___INT(___GCHASHTABLELENGTH(ht)) - ___GCHASHTABLE_KEY0;
   ___GCHASHTABLE_HASH_STEP(probe2, step2, key, size2>>1);
   probe2 <<= 1;
   step2 <<= 1;
-  obj = ___FIELD(ht, probe2+___GCHASHTABLE_KEY0);
+  obj = ___FIELD(WEAK,ht, probe2+___GCHASHTABLE_KEY0);
 
   if (___EQP(obj,key))
-    return ___FIELD(ht, probe2+___GCHASHTABLE_VAL0);
+    {
+      result = ___FIELD(WEAK, ht, probe2+___GCHASHTABLE_VAL0);
+    }
   else if (!___EQP(obj,___UNUSED))
     {
+      result = ___UNUSED;
       for (;;)
         {
           probe2 -= step2;
           if (probe2 < 0)
             probe2 += size2;
-          obj = ___FIELD(ht, probe2+___GCHASHTABLE_KEY0);
+          obj = ___FIELD(WEAK, ht, probe2+___GCHASHTABLE_KEY0);
 
           if (___EQP(obj,key))
-            return ___FIELD(ht, probe2+___GCHASHTABLE_VAL0);
+            {
+              result = ___FIELD(WEAK, ht, probe2+___GCHASHTABLE_VAL0);
+              break;
+            }
           else if (___EQP(obj,___UNUSED))
             break;
         }
     }
+  else
+    {
+      result = ___UNUSED; /* key was not found */
+    }
 
-  return ___UNUSED; /* key was not found */
+  GCHT_UNLOCK(ht);
+  return result;
 }
 
 
@@ -5675,20 +5909,25 @@ ___SCMOBJ val;)
   int probe2;
   int step2;
   ___SCMOBJ obj;
+  ___SCMOBJ result;
+
+  GCHT_LOCK(ht);
 
 #ifdef ___GC_HASH_TABLE_REHASH_LAZILY
 
-  if (!___FIXZEROP(___FIXAND(___FIELD(ht, ___GCHASHTABLE_FLAGS),
+  if (!___FIXZEROP(___FIXAND(___GCHASHTABLE_FLAGS_FIELD(ht),
                              ___FIX(___GCHASHTABLE_FLAG_KEY_MOVED))))
     gc_hash_table_rehash_in_situ (ht);
 
 #endif
 
-  size2 = ___INT(___VECTORLENGTH(ht)) - ___GCHASHTABLE_KEY0;
+  size2 = ___INT(___GCHASHTABLELENGTH(ht)) - ___GCHASHTABLE_KEY0;
   ___GCHASHTABLE_HASH_STEP(probe2, step2, key, size2>>1);
   probe2 <<= 1;
   step2 <<= 1;
-  obj = ___FIELD(ht, probe2+___GCHASHTABLE_KEY0);
+  obj = ___FIELD(WEAK, ht, probe2+___GCHASHTABLE_KEY0);
+
+  result = ___FAL; /* default: table does not need to be resized */
 
   if (!___EQP(val,___ABSENT))
     {
@@ -5697,19 +5936,21 @@ ___SCMOBJ val;)
       if (___EQP(obj,key))
         {
         replace_entry:
-          ___FIELD(ht, probe2+___GCHASHTABLE_VAL0) = val;
+          ___FIELD(WEAK, ht, probe2+___GCHASHTABLE_VAL0) = val;
         }
       else if (___EQP(obj,___UNUSED))
         {
         add_entry:
-          ___FIELD(ht, probe2+___GCHASHTABLE_KEY0) = key;
-          ___FIELD(ht, probe2+___GCHASHTABLE_VAL0) = val;
-          ___FIELD(ht, ___GCHASHTABLE_COUNT) =
-            ___FIXADD(___FIELD(ht, ___GCHASHTABLE_COUNT), ___FIX(1));
-          if (___FIXNEGATIVEP(___FIELD(ht, ___GCHASHTABLE_FREE) =
-                                ___FIXSUB(___FIELD(ht, ___GCHASHTABLE_FREE),
+          ___FIELD(WEAK, ht, probe2+___GCHASHTABLE_KEY0) = key;
+          ___FIELD(WEAK, ht, probe2+___GCHASHTABLE_VAL0) = val;
+          ___GCHASHTABLE_COUNT_FIELD(ht) =
+            ___FIXADD(___GCHASHTABLE_COUNT_FIELD(ht), ___FIX(1));
+          if (___FIXNEGATIVEP(___GCHASHTABLE_FREE_FIELD(ht) =
+                                ___FIXSUB(___GCHASHTABLE_FREE_FIELD(ht),
                                           ___FIX(1))))
-            return ___TRU;
+            {
+              result = ___TRU;
+            }
         }
       else
         {
@@ -5723,7 +5964,7 @@ ___SCMOBJ val;)
               probe2 -= step2;
               if (probe2 < 0)
                 probe2 += size2;
-              obj = ___FIELD(ht, probe2+___GCHASHTABLE_KEY0);
+              obj = ___FIELD(WEAK, ht, probe2+___GCHASHTABLE_KEY0);
 
               if (___EQP(obj,key))
                 goto replace_entry;
@@ -5733,10 +5974,10 @@ ___SCMOBJ val;)
                   if (deleted2 < 0)
                     goto add_entry;
 
-                  ___FIELD(ht, deleted2+___GCHASHTABLE_KEY0) = key;
-                  ___FIELD(ht, deleted2+___GCHASHTABLE_VAL0) = val;
-                  ___FIELD(ht, ___GCHASHTABLE_COUNT) =
-                    ___FIXADD(___FIELD(ht, ___GCHASHTABLE_COUNT), ___FIX(1));
+                  ___FIELD(WEAK, ht, deleted2+___GCHASHTABLE_KEY0) = key;
+                  ___FIELD(WEAK, ht, deleted2+___GCHASHTABLE_VAL0) = val;
+                  ___GCHASHTABLE_COUNT_FIELD(ht) =
+                    ___FIXADD(___GCHASHTABLE_COUNT_FIELD(ht), ___FIX(1));
 
                   break;
                 }
@@ -5750,14 +5991,16 @@ ___SCMOBJ val;)
       if (___EQP(obj,key))
         {
         delete_entry:
-          ___FIELD(ht, probe2+___GCHASHTABLE_KEY0) = ___DELETED;
-          ___FIELD(ht, probe2+___GCHASHTABLE_VAL0) = ___UNUSED;
-          ___FIELD(ht, ___GCHASHTABLE_COUNT) =
-            ___FIXSUB(___FIELD(ht, ___GCHASHTABLE_COUNT),
+          ___FIELD(WEAK, ht, probe2+___GCHASHTABLE_KEY0) = ___DELETED;
+          ___FIELD(WEAK, ht, probe2+___GCHASHTABLE_VAL0) = ___UNUSED;
+          ___GCHASHTABLE_COUNT_FIELD(ht) =
+            ___FIXSUB(___GCHASHTABLE_COUNT_FIELD(ht),
                       ___FIX(1));
-          if (___FIXLT(___FIELD(ht, ___GCHASHTABLE_COUNT),
-                       ___FIELD(ht, ___GCHASHTABLE_MIN_COUNT)))
-            return ___TRU;
+          if (___FIXLT(___GCHASHTABLE_COUNT_FIELD(ht),
+                       ___GCHASHTABLE_MIN_COUNT_FIELD(ht)))
+            {
+              result = ___TRU;
+            }
         }
       else if (!___EQP(obj,___UNUSED))
         {
@@ -5766,7 +6009,7 @@ ___SCMOBJ val;)
               probe2 -= step2;
               if (probe2 < 0)
                 probe2 += size2;
-              obj = ___FIELD(ht, probe2+___GCHASHTABLE_KEY0);
+              obj = ___FIELD(WEAK, ht, probe2+___GCHASHTABLE_KEY0);
 
               if (___EQP(obj,key))
                 goto delete_entry;
@@ -5777,11 +6020,8 @@ ___SCMOBJ val;)
         }
     }
 
- /*
-  * Hash table does not need to be resized.
-  */
-
-  return ___FAL;
+  GCHT_UNLOCK(ht);
+  return result;
 }
 
 
@@ -5790,14 +6030,14 @@ do {                                                                          \
   ___GCHASHTABLE_HASH_STEP(key_probe2,key_step2,key,size2>>1);                \
   key_probe2 <<= 1;                                                           \
   key_step2 <<= 1;                                                            \
-  obj = ___FIELD(ht, key_probe2+___GCHASHTABLE_KEY0);                         \
+  obj = ___FIELD(WEAK, ht, key_probe2+___GCHASHTABLE_KEY0);                   \
                                                                               \
   while (!(___EQP(obj,key) || ___EQP(obj,___UNUSED)))                         \
     {                                                                         \
       key_probe2 -= key_step2;                                                \
       if (key_probe2 < 0)                                                     \
         key_probe2 += size2;                                                  \
-      obj = ___FIELD(ht, key_probe2+___GCHASHTABLE_KEY0);                     \
+      obj = ___FIELD(WEAK, ht, key_probe2+___GCHASHTABLE_KEY0);               \
     }                                                                         \
                                                                               \
   if (___EQP(obj,key))                                                        \
@@ -5806,7 +6046,7 @@ do {                                                                          \
        * key was found, compress its path.                                    \
        */                                                                     \
                                                                               \
-      k = ___FIELD(ht, key_probe2+___GCHASHTABLE_VAL0);                       \
+      k = ___FIELD(WEAK, ht, key_probe2+___GCHASHTABLE_VAL0);                 \
                                                                               \
       if (___SPECIALP(k))                                                     \
         {                                                                     \
@@ -5829,30 +6069,30 @@ do {                                                                          \
                   ___GCHASHTABLE_HASH_STEP(k_probe2,k_step2,k,size2>>1);      \
                   k_probe2 <<= 1;                                             \
                   k_step2 <<= 1;                                              \
-                  o = ___FIELD(ht, k_probe2+___GCHASHTABLE_KEY0);             \
+                  o = ___FIELD(WEAK, ht, k_probe2+___GCHASHTABLE_KEY0);       \
                                                                               \
                   while (!___EQP(o,k))                                        \
                     {                                                         \
                       k_probe2 -= k_step2;                                    \
                       if (k_probe2 < 0)                                       \
                         k_probe2 += size2;                                    \
-                      o = ___FIELD(ht, k_probe2+___GCHASHTABLE_KEY0);         \
+                      o = ___FIELD(WEAK, ht, k_probe2+___GCHASHTABLE_KEY0);   \
                     }                                                         \
                 }                                                             \
                                                                               \
-              k = ___FIELD(ht, k_probe2+___GCHASHTABLE_VAL0);                 \
+              k = ___FIELD(WEAK, ht, k_probe2+___GCHASHTABLE_VAL0);           \
                                                                               \
               if (___SPECIALP(k))                                             \
                 break;                                                        \
                                                                               \
-              ___FIELD(ht, k_probe2+___GCHASHTABLE_VAL0) = ___FIX(k_prev2);   \
+              ___FIELD(WEAK, ht, k_probe2+___GCHASHTABLE_VAL0) = ___FIX(k_prev2); \
               k_prev2 = k_probe2;                                             \
             }                                                                 \
                                                                               \
           for (;;)                                                            \
             {                                                                 \
-              ___SCMOBJ k_p2 = ___INT(___FIELD(ht, k_prev2+___GCHASHTABLE_VAL0)); \
-              ___FIELD(ht, k_prev2+___GCHASHTABLE_VAL0) = ___FIX(k_probe2);   \
+              ___SCMOBJ k_p2 = ___INT(___FIELD(WEAK, ht, k_prev2+___GCHASHTABLE_VAL0)); \
+              ___FIELD(WEAK, ht, k_prev2+___GCHASHTABLE_VAL0) = ___FIX(k_probe2); \
               if (k_prev2 == key_probe2)                                      \
                 break;                                                        \
               k_prev2 = k_p2;                                                 \
@@ -5905,16 +6145,19 @@ ___BOOL find;)
   ___SCMOBJ k1_probe2 = ___FIX(0);
   ___SCMOBJ k2 = ___FIX(0);
   ___SCMOBJ k2_probe2 = ___FIX(0);
+  ___SCMOBJ result;
+
+  GCHT_LOCK(ht);
 
 #ifdef ___GC_HASH_TABLE_REHASH_LAZILY
 
-  if (!___FIXZEROP(___FIXAND(___FIELD(ht, ___GCHASHTABLE_FLAGS),
+  if (!___FIXZEROP(___FIXAND(___GCHASHTABLE_FLAGS_FIELD(ht),
                              ___FIX(___GCHASHTABLE_FLAG_KEY_MOVED))))
     gc_hash_table_rehash_in_situ (ht);
 
 #endif
 
-  size2 = ___INT(___VECTORLENGTH(ht)) - ___GCHASHTABLE_KEY0;
+  size2 = ___INT(___GCHASHTABLELENGTH(ht)) - ___GCHASHTABLE_KEY0;
 
   /* Search for key1 */
 
@@ -5951,39 +6194,53 @@ ___BOOL find;)
           /* both key1 and key2 were found in the table */
 
           if (k1_probe2 == k2_probe2)
-            return ___FIX(0); /* keys are in the same equiv class */
+            {
+              result = ___FIX(0); /* keys are in the same equiv class */
+              goto done;
+            }
 
           if (find)
-            return ___FIX(1); /* keys are not in the same equiv class */
+            {
+              result = ___FIX(1); /* keys are not in the same equiv class */
+              goto done;
+            }
 
           k1 = ___INT(k1);
           k2 = ___INT(k2);
 
           if (k1 > k2) /* choose biggest equivalence class */
             {
-              ___FIELD(ht, k1_probe2+___GCHASHTABLE_VAL0) = ___SPECIAL(k1+k2);
-              ___FIELD(ht, k2_probe2+___GCHASHTABLE_VAL0) = ___FIX(k1_probe2);
+              ___FIELD(WEAK, ht, k1_probe2+___GCHASHTABLE_VAL0) =
+                ___SPECIAL(k1+k2);
+              ___FIELD(WEAK, ht, k2_probe2+___GCHASHTABLE_VAL0) =
+                ___FIX(k1_probe2);
             }
           else
             {
-              ___FIELD(ht, k2_probe2+___GCHASHTABLE_VAL0) = ___SPECIAL(k1+k2);
-              ___FIELD(ht, k1_probe2+___GCHASHTABLE_VAL0) = ___FIX(k2_probe2);
+              ___FIELD(WEAK, ht, k2_probe2+___GCHASHTABLE_VAL0) =
+                ___SPECIAL(k1+k2);
+              ___FIELD(WEAK, ht, k1_probe2+___GCHASHTABLE_VAL0) =
+                ___FIX(k2_probe2);
             }
 
-          return ___FIX(1);
+          result = ___FIX(1);
+          goto done;
         }
       else
         {
           /* key1 was found in the table, but key2 was not found */
 
           if (find)
-            return ___FIX(3); /* keys are not in the same equiv class */
+            {
+              result = ___FIX(3); /* keys are not in the same equiv class */
+              goto done;
+            }
 
           k1 = ___INT(k1);
 
-          ___FIELD(ht, k1_probe2+___GCHASHTABLE_VAL0) = ___SPECIAL(k1+1);
-          ___FIELD(ht, key2_probe2+___GCHASHTABLE_KEY0) = key2;
-          ___FIELD(ht, key2_probe2+___GCHASHTABLE_VAL0) = ___FIX(k1_probe2);
+          ___FIELD(WEAK, ht, k1_probe2+___GCHASHTABLE_VAL0) = ___SPECIAL(k1+1);
+          ___FIELD(WEAK, ht, key2_probe2+___GCHASHTABLE_KEY0) = key2;
+          ___FIELD(WEAK, ht, key2_probe2+___GCHASHTABLE_VAL0) = ___FIX(k1_probe2);
           allocated = 1;
         }
     }
@@ -5996,13 +6253,16 @@ ___BOOL find;)
           /* key2 was found in the table, but key1 was not found */
 
           if (find)
-            return ___FIX(3); /* keys are not in the same equiv class */
+            {
+              result = ___FIX(3); /* keys are not in the same equiv class */
+              goto done;
+            }
 
           k2 = ___INT(k2);
 
-          ___FIELD(ht, k2_probe2+___GCHASHTABLE_VAL0) = ___SPECIAL(k2+1);
-          ___FIELD(ht, key1_probe2+___GCHASHTABLE_KEY0) = key1;
-          ___FIELD(ht, key1_probe2+___GCHASHTABLE_VAL0) = ___FIX(k2_probe2);
+          ___FIELD(WEAK, ht, k2_probe2+___GCHASHTABLE_VAL0) = ___SPECIAL(k2+1);
+          ___FIELD(WEAK, ht, key1_probe2+___GCHASHTABLE_KEY0) = key1;
+          ___FIELD(WEAK, ht, key1_probe2+___GCHASHTABLE_VAL0) = ___FIX(k2_probe2);
           allocated = 1;
         }
       else
@@ -6010,10 +6270,13 @@ ___BOOL find;)
           /* key1 and key2 were not found in the table */
 
           if (find)
-            return ___FIX(5); /* keys are not in the same equiv class */
+            {
+              result = ___FIX(5); /* keys are not in the same equiv class */
+              goto done;
+            }
 
-          ___FIELD(ht, key1_probe2+___GCHASHTABLE_KEY0) = key1;
-          ___FIELD(ht, key1_probe2+___GCHASHTABLE_VAL0) = ___SPECIAL(2);
+          ___FIELD(WEAK, ht, key1_probe2+___GCHASHTABLE_KEY0) = key1;
+          ___FIELD(WEAK, ht, key1_probe2+___GCHASHTABLE_VAL0) = ___SPECIAL(2);
 
           if (key1_probe2 == key2_probe2)
             {
@@ -6027,25 +6290,33 @@ ___BOOL find;)
                   key2_probe2 -= key2_step2;
                   if (key2_probe2 < 0)
                     key2_probe2 += size2;
-                } while (!___EQP(___FIELD(ht, key2_probe2+___GCHASHTABLE_KEY0),
+                } while (!___EQP(___FIELD(WEAK, ht, key2_probe2+___GCHASHTABLE_KEY0),
                                  ___UNUSED));
             }
 
-          ___FIELD(ht, key2_probe2+___GCHASHTABLE_KEY0) = key2;
-          ___FIELD(ht, key2_probe2+___GCHASHTABLE_VAL0) = ___FIX(key1_probe2);
+          ___FIELD(WEAK, ht, key2_probe2+___GCHASHTABLE_KEY0) = key2;
+          ___FIELD(WEAK, ht, key2_probe2+___GCHASHTABLE_VAL0) = ___FIX(key1_probe2);
           allocated = 2;
         }
     }
 
-  ___FIELD(ht, ___GCHASHTABLE_COUNT) =
-    ___FIXADD(___FIELD(ht, ___GCHASHTABLE_COUNT), ___FIX(allocated));
+  ___GCHASHTABLE_COUNT_FIELD(ht) =
+    ___FIXADD(___GCHASHTABLE_COUNT_FIELD(ht), ___FIX(allocated));
 
-  if (___FIXNEGATIVEP(___FIELD(ht, ___GCHASHTABLE_FREE) =
-                      ___FIXSUB(___FIELD(ht, ___GCHASHTABLE_FREE),
+  if (___FIXNEGATIVEP(___GCHASHTABLE_FREE_FIELD(ht) =
+                      ___FIXSUB(___GCHASHTABLE_FREE_FIELD(ht),
                                 ___FIX(allocated))))
-    return ___FIX(allocated*2); /* signal that table needs to grow */
+    {
+      result = ___FIX(allocated*2); /* signal that table needs to grow */
+    }
   else
-    return ___FIX(allocated*2+1); /* signal that table doesn't need to grow */
+    {
+      result = ___FIX(allocated*2+1); /* signal that table doesn't need to grow */
+    }
+
+done:
+  GCHT_UNLOCK(ht);
+  return result;
 }
 
 
@@ -6057,10 +6328,25 @@ ___SCMOBJ ___gc_hash_table_rehash
 ___SCMOBJ ht_src;
 ___SCMOBJ ht_dst;)
 {
-  ___SCMOBJ* body_src = ___BODY_AS(ht_src,___tSUBTYPED);
-  ___SIZE_TS words = ___HD_WORDS(body_src[-1]);
-  int size2 = words - ___GCHASHTABLE_KEY0;
+  ___SCMOBJ* body_src;
+  ___SIZE_TS words;
+  int size2;
   int i;
+
+  /*
+   * Do NOT hold GCHT_LOCK(ht_src) here.  ___gc_hash_table_set takes
+   * GCHT_LOCK(ht_dst) internally.  With the striped spinlock array
+   * (64 slots), ht_src and ht_dst can hash to the same slot, and
+   * the non-reentrant CAS would self-deadlock.
+   *
+   * No lock is needed on ht_src because the Scheme-level ##table-rehash!
+   * ensures exclusive access to the source table during rehash.  ht_dst
+   * is a freshly allocated table not yet visible to other threads.
+   */
+
+  body_src = ___BODY_AS(ht_src,___tSUBTYPED);
+  words = ___HD_WORDS(body_src[-1]);
+  size2 = words - ___GCHASHTABLE_KEY0;
 
   if (___FIXZEROP(___FIXAND(body_src[___GCHASHTABLE_FLAGS],
                             ___FIX(___GCHASHTABLE_FLAG_UNION_FIND))))
@@ -6124,7 +6410,21 @@ ___PSDKR)
 
   alloc_stack_ptr = p2;
 
-  ___FP_SET_STK(alloc_stack_ptr,
+  /*
+   * Mark the first break frame as not created by a stack section
+   * overflow, so that ___stack_overflow_undo_if_possible will not
+   * try to undo to a previous msection.
+   *
+   * NOTE: This must write to ___ps->stack_break (the first break
+   * frame position), NOT alloc_stack_ptr (the current fp position).
+   * When there are frames on the stack (length > FIRST_BREAK_FRAME_SPACE),
+   * alloc_stack_ptr is below the first break frame, and writing to
+   * alloc_stack_ptr[FIRST_BREAK_FRAME_STACK_MSECTION] would miss the
+   * actual STACK_MSECTION slot, leaving stale data that could cause
+   * ___stack_overflow_undo_if_possible to corrupt stack_break.
+   */
+
+  ___FP_SET_STK(___ps->stack_break,
                 -___FIRST_BREAK_FRAME_STACK_MSECTION,
                 ___CAST(___WORD,
                         ___CAST(___msection*,NULL))) /* not a stack section overflow */
@@ -6260,6 +6560,31 @@ ___SIZE_TS requested_words_still;)
 
   SET_MAX(target_nb_sections,
           nb_msections_assigned);
+
+#if ___TARGET_MSECTIONS_HIST_LENGTH > 0
+
+  /*
+   * Do not shrink the number of msections abruptly. The number of
+   * msections will be at least the target size in recent history.
+   */
+
+  {
+    int m = target_nb_sections;
+    int i;
+
+    for (i=0; i<___TARGET_MSECTIONS_HIST_LENGTH; i++)
+      if (target_msections_hist[i] > m)
+        m = target_msections_hist[i];
+
+    target_msections_hist_last =
+      (target_msections_hist_last+1) % ___TARGET_MSECTIONS_HIST_LENGTH;
+
+    target_msections_hist[target_msections_hist_last] = target_nb_sections;
+
+    target_nb_sections = m;
+  }
+
+#endif
 
   adjust_msections (&the_msections, target_nb_sections);
 
@@ -6620,8 +6945,9 @@ ___PSDKR)
     {
       mark_vm_scmobj (___PSPNC);
       mark_symkey_tables (___PSPNC);
-      mark_rc (___PSPNC);
     }
+
+  mark_rc (___PSPNC); /* each processor marks its own per-processor RC list */
 
   mark_global_variables (___PSPNC);
 
@@ -6634,6 +6960,20 @@ ___PSDKR)
   mark_type_cache (___PSPNC);
 
   mark_processor_scmobj (___PSPNC);
+
+  /*
+   * Ensure all processors have completed root marking (especially
+   * mark_captured_continuation which copies stack frames to the heap
+   * and installs forwarding pointers) before any processor begins
+   * the transitive scan.  Without this barrier, a processor that
+   * finishes root marking early can steal heap chunks and scan
+   * ___sCONTINUATION objects that reference stack frames still being
+   * copied by another processor's mark_captured_continuation, leading
+   * to races on the forwarding pointers and partially-written
+   * ___sFRAME heap objects.
+   */
+
+  BARRIER();
 
   mark_reachable_from_marked (___PSPNC);
 
@@ -7009,6 +7349,21 @@ ___PSDKR)
        */
 
       ___FP_ADJFP(alloc_stack_ptr,___FIRST_BREAK_FRAME_SPACE)
+
+      /*
+       * Initialize the first break frame's msection field to NULL.
+       * This is needed because if the "reached break frame" path is
+       * taken (instead of "reached max frames"), the STACK_MSECTION
+       * and STACK_BREAK fields won't be explicitly set.  Without
+       * this initialization, ___stack_overflow_undo_if_possible may
+       * read stale data from a previous use of this msection,
+       * potentially causing stack_break corruption and crashes.
+       */
+
+      ___FP_SET_STK(alloc_stack_ptr,
+                    -___FIRST_BREAK_FRAME_STACK_MSECTION,
+                    ___CAST(___WORD,
+                            ___CAST(___msection*,NULL)))
 
       /*
        * Because ___stack_limit is only called by the stack-limit

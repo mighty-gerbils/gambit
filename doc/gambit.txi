@@ -499,18 +499,17 @@ An error is not signaled when the file does not exist.  Interpreter
 extensions and patches that are meant to apply to all users and all
 modes should go in that file.
 
-Extensions which are meant to apply to a single user or to a specific
-working directory are best placed in the @dfn{initialization file},
-which is a file containing Scheme code.  In all modes, the interpreter
-first tries to locate the initialization file by searching the
-following locations: @file{.gambini} and @file{~/.gambini} (with no
-extension, a @samp{.sld} extension, a @samp{.scm} extension, and a
-@samp{.six} extension in that order).  The first file that is found is
-examined as though the expression @code{(include
-@var{initialization-file})} had been entered at the read-eval-print
-loop where @var{initialization-file} is the file that was found.  Note
-that by using an @code{include} the macros defined in the
-initialization file will be visible from the read-eval-print loop
+Extensions which are meant to apply to a single user are best placed
+in the @dfn{initialization file}, which is a file containing Scheme
+code.  In all modes, the interpreter first tries to locate the
+initialization file by searching the following locations:
+@file{~/.gambini} (with no extension, a @samp{.sld} extension, a
+@samp{.scm} extension, and a @samp{.six} extension in that order).
+The first file that is found is examined as though the expression
+@code{(include @var{initialization-file})} had been entered at the
+read-eval-print loop where @var{initialization-file} is the file that
+was found.  Note that by using an @code{include} the macros defined in
+the initialization file will be visible from the read-eval-print loop
 (this would not have been the case if @code{load} had been used).  The
 initialization file is not searched for or examined when the @samp{-f}
 option is specified.
@@ -5124,13 +5123,22 @@ known to be of the given type (all primitives if none specified).
 @opindex mostly-generic
 @opindex mostly-fixnum
 @opindex mostly-fixnum-flonum
+@opindex mostly-fixnum-iflonum
 @opindex mostly-flonum
+@opindex mostly-iflonum
 @opindex mostly-flonum-fixnum
+@opindex mostly-iflonum-fixnum
 Numeric arguments and result of the specified primitives are expected
 to be most often of the given type (all primitives if none specified).
 @var{mostly-number-type} can be: @samp{mostly-generic},
-@samp{mostly-fixnum}, @samp{mostly-fixnum-flonum},
-@samp{mostly-flonum}, or @samp{mostly-flonum-fixnum}.
+@samp{mostly-fixnum}, @samp{mostly-fixnum-flonum}, @samp{mostly-fixnum-iflonum},
+@samp{mostly-flonum}, @samp{mostly-iflonum}, @samp{mostly-flonum-fixnum},
+or @samp{mostly-iflonum-fixnum}.
+The term @samp{iflonum} (immediate flonum) means a floating point value
+that does not need memory allocation (typically floating point values
+that are close to 1.0). If the system is built to treat all floating point values
+the same way (for example when using NaN-boxing or heap-allocated flonums)
+@samp{iflonum} is equivalent to @samp{flonum}.
 
 @end table
 
@@ -5161,7 +5169,7 @@ The default declarations used by the compiler are equivalent to:
   (optimize-dead-local-variables)
   (not optimize-dead-definitions)
   (generic)
-  (mostly-fixnum-flonum)
+  (mostly-fixnum-iflonum)
 )
 @end smallexample
 
@@ -5458,9 +5466,6 @@ The procedures in this section are not yet documented.
 @end deffn
 
 @deffn procedure get-environment-variables
-@end deffn
-
-@deffn procedure executable-path
 @end deffn
 
 @deffn procedure command-name
@@ -12906,7 +12911,7 @@ operating systems supported by Gambit (e.g. MSDOS).
 * Filesystem operations::                   Filesystem operations
 * Shell command execution::                 Shell command execution
 * Process termination::                     Process termination
-* Command line arguments::                  Command line arguments
+* Invocation information::                  Invocation information
 * Environment variables::                   Environment variables
 * Measuring time::                          Measuring time
 * File information::                        File information
@@ -13379,7 +13384,7 @@ For example under Windows:
 
 @end deffn
 
-@node Process termination, Command line arguments, Shell command execution, Host environment
+@node Process termination, Invocation information, Shell command execution, Host environment
 @section Process termination
 
 @deffn procedure exit @r{[}@var{status}@r{]}
@@ -13402,8 +13407,8 @@ $ @b{echo $?}
 
 @end deffn
 
-@node Command line arguments, Environment variables, Process termination, Host environment
-@section Command line arguments
+@node Invocation information
+@section Invocation information
 
 @deffn procedure command-line
 
@@ -13427,7 +13432,27 @@ $ @b{./foo 1 2 "3 4"}
 
 @end deffn
 
-@node Environment variables, Measuring time, Command line arguments, Host environment
+@deffn procedure executable-path
+
+This procedure returns a string representing a
+@dfn{normalized path} to the executable file from which the running process
+spawned.  The path is determined dynamically using a mechanism specific
+to the host operating system.
+
+For example under UNIX:
+
+@smallexample
+$ @b{echo '(pp (executable-path))' > ep.scm}
+$ @b{gsc -exe ep.scm}
+$ @b{pwd}
+/gambit/example
+$ @b{./ep}
+"/gambit/example/ep"
+@end smallexample
+
+@end deffn
+
+@node Environment variables, Measuring time, Invocation information, Host environment
 @section Environment variables
 
 @deffn procedure getenv @var{name} @r{[}@var{default}@r{]}
@@ -16824,6 +16849,17 @@ return the end-of-file object for all subsequent calls to the
 @code{read} procedure.  A non-permanently closed bidirectional
 vector-port will return to its opened state when its end-of-file is
 read.  The default value of this setting is @code{#t}.
+
+@item
+@code{capacity:} ( @code{#f} | @var{positive-exact-integer} )
+
+This setting places a limit on the number of objects stored in the
+port, i.e. objects written to the port but not yet read.  A value of
+@code{#f} removes the limit.  When the limit is reached threads are
+blocked from writing to the port until enough stored objects are read
+from the port. This is a useful feature in a producer-consumer
+scenario where the producer is faster than the consumer.  The default
+value of this setting is @code{#f}.
 
 @end itemize
 
